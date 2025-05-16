@@ -1,1 +1,1 @@
-web: node telegram-webhook-server.js
+web: node server.js
