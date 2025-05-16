@@ -42,13 +42,86 @@ async function sendTelegramMessage(chatId, text) {
   }
 }
 
+// Funkce pro odeslání zprávy s tlačítkem pro odpověď
+async function sendTelegramMessageWithReplyButton(chatId, text, conversationId) {
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Odpovědět",
+                callback_data: `reply_to_${conversationId}`
+              }
+            ]
+          ]
+        }
+      }),
+    });
+
+    const data = await response.json();
+    console.log('Telegram API odpověď s tlačítkem:', data);
+    return data;
+  } catch (error) {
+    console.error('Chyba při odesílání zprávy s tlačítkem přes Telegram API:', error);
+    throw error;
+  }
+}
+
 // Endpoint pro Telegram webhook
 app.post('/webhook', async (req, res) => {
   try {
     console.log('Přijat webhook požadavek od Telegramu:', JSON.stringify(req.body));
 
+    // Zpracování callback query (když uživatel klikne na tlačítko)
+    if (req.body.callback_query) {
+      const callbackQuery = req.body.callback_query;
+      const chatId = callbackQuery.message.chat.id;
+      const callbackData = callbackQuery.data;
+      
+      // Pokud je to odpověď na konverzaci
+      if (callbackData.startsWith('reply_to_')) {
+        const conversationId = callbackData.replace('reply_to_', '');
+        
+        // Odeslání zprávy s instrukcemi pro odpověď
+        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: `Nyní napište svou odpověď ve formátu:\n/reply ${conversationId} Vaše odpověď`,
+            parse_mode: 'HTML',
+          }),
+        });
+        
+        // Odpověď na callback query
+        await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            callback_query_id: callbackQuery.id,
+            text: "Připraveno k odpovědi",
+          }),
+        });
+      }
+      
+      return res.status(200).json({ success: true });
+    }
+
     // Kontrola, zda požadavek obsahuje zprávu
-    if (!req.body || !req.body.message || !req.body.message.text) {
+    if (!req.body.message || !req.body.message.text) {
       console.log('Požadavek neobsahuje zprávu');
       return res.status(200).json({ success: true });
     }
@@ -244,6 +317,77 @@ ID konverzace: ${conversationId}
   } catch (error) {
     console.error('Chyba při zpracování webhook požadavku:', error);
     return res.status(500).json({ error: 'Chyba při zpracování webhook požadavku' });
+  }
+});
+
+// Endpoint pro příjem notifikací z chatbotu
+app.post('/notify', async (req, res) => {
+  try {
+    console.log('Přijata notifikace z chatbotu:', JSON.stringify(req.body));
+    
+    // Kontrola, zda požadavek obsahuje potřebné údaje
+    if (!req.body.conversationId || !req.body.visitorId || !req.body.chatbotId || !req.body.message) {
+      console.log('Požadavek neobsahuje potřebné údaje');
+      return res.status(400).json({ error: 'Chybí potřebné údaje' });
+    }
+    
+    const { conversationId, visitorId, chatbotId, message, visitorName } = req.body;
+    
+    // Získání informací o chatbotu a uživateli
+    const client = await pool.connect();
+    
+    try {
+      const chatbotResult = await client.query(
+        'SELECT id, name, user_id FROM chatbots WHERE id = $1',
+        [chatbotId]
+      );
+      
+      if (chatbotResult.rows.length === 0) {
+        console.log('Chatbot nebyl nalezen');
+        return res.status(404).json({ error: 'Chatbot nebyl nalezen' });
+      }
+      
+      const chatbot = chatbotResult.rows[0];
+      
+      // Získání nastavení Telegram notifikací pro uživatele
+      const settingsResult = await client.query(
+        'SELECT telegram_bot_token, telegram_chat_id, telegram_notifications, telegram_live_operator FROM reservation_settings WHERE user_id = $1',
+        [chatbot.user_id]
+      );
+      
+      if (settingsResult.rows.length === 0 || !settingsResult.rows[0].telegram_chat_id || !settingsResult.rows[0].telegram_notifications) {
+        console.log('Uživatel nemá nastavené Telegram notifikace');
+        return res.status(200).json({ success: true, message: 'Uživatel nemá nastavené Telegram notifikace' });
+      }
+      
+      const settings = settingsResult.rows[0];
+      const chatId = settings.telegram_chat_id;
+      
+      // Vytvoření zprávy pro Telegram
+      const visitorInfo = visitorName ? `od ${visitorName}` : '';
+      const telegramMessage = `
+<b>Nová zpráva z chatbotu ${chatbot.name}</b> ${visitorInfo}
+
+Zpráva: ${message}
+
+ID konverzace: ${conversationId}
+ID návštěvníka: ${visitorId}
+Čas: ${new Date().toLocaleString()}
+
+Pro odpověď použijte příkaz:
+/reply ${conversationId} Vaše odpověď
+`;
+      
+      // Odeslání zprávy s tlačítkem pro odpověď
+      await sendTelegramMessageWithReplyButton(chatId, telegramMessage, conversationId);
+      
+      return res.status(200).json({ success: true });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Chyba při zpracování notifikace:', error);
+    return res.status(500).json({ error: 'Chyba při zpracování notifikace' });
   }
 });
 
